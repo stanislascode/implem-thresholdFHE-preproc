@@ -1,0 +1,26 @@
+# modconv1_preproc_finalize_q.mpc
+#
+# Step 5-6 of Pi_ModConv1Preproc (q side): once modconv1_preproc_t.mpc has
+# revealed which of the kappa_retries candidates was accepted (r_star, a
+# public integer -- the paper's own protocol reveals exactly this, see
+# modconv1_preproc_README.md), read that candidate's (m_L, m_U) back from
+# the q-domain Persistence file that modconv1_preproc_q.mpc wrote, form
+# m = m_L + ceil(q/2)*m_U (a local Comb), and persist the result at a
+# reserved slot for the online phase to pick up later. Nothing is ever
+# opened here -- m_L, m_U and m all stay secret-shared throughout.
+#
+# Compile-time args: <q> <kappa_retries> <r_star>
+
+q = int(program.args[1])
+kappa_retries = int(program.args[2])
+r_star = int(program.args[3])
+
+assert 0 <= r_star < kappa_retries
+
+_, (m_L, m_U) = sint.read_from_file(2 * r_star, n_items=2)
+ceil_q_2 = -(-q // 2)
+m = m_L + ceil_q_2 * m_U
+
+# Final slot, past every candidate's (m_L, m_U) pair, so this can share the
+# same Persistence file as the candidates without clobbering them.
+sint.write_to_file([m], position=2 * kappa_retries)

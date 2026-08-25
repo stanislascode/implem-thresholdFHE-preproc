@@ -1,0 +1,102 @@
+# modconv1_preproc_q.mpc
+#
+# The q-domain half of Pi_ModConv1Preproc^{q,t,Q} for beta=2 (paper Section
+# 4.1, "Secure preprocessing for Pi_ModConv1^{q,t,2}"), with the auxiliary
+# modulus Q set to t (one of the paper's own suggested choices -- "Taking
+# Q to be q or t ... costs nothing at all, the MultiBits then being over
+# two moduli rather than three"). See modconv1_preproc_README.md for the
+# full pipeline this script is one stage of.
+#
+# What this script does:
+#   1. xorBits(q) + the "side i" half of MultiBitsConsCheck, EXACTLY as
+#      multibits_small.mpc (same bitness check, same coin-tossed r/z) --
+#      generating k*kappa_retries bits shared over q, where
+#      k = ceil(log2(q)). These are k independent candidate masks worth of
+#      MultiBit material (batched up front rather than generated one retry
+#      at a time -- see the README for why that's a documented, harmless
+#      simplification here).
+#   2. For each of the kappa_retries candidates, forms m_L (the low k-1
+#      bits) and m_U (the top bit) via a purely local linear combination
+#      (Comb is free) and PERSISTS both, per candidate, via
+#      sint.write_to_file -- never revealing them. The t-domain sibling
+#      script (modconv1_preproc_t.mpc) independently decides, via the real
+#      Compare protocol, which candidate is accepted; that decision index
+#      is public (the paper's own security proof reveals exactly this: a
+#      transcript of accept/reject bits) and is fed into
+#      modconv1_preproc_finalize_q.mpc afterwards to pick the matching
+#      persisted candidate here and turn it into the final shared mask.
+#
+# Compile-time args: <n_parties> <n> <n_prime> <tau_i> <R_i> <base_i> <k>
+#                     <kappa_retries>
+#   n must equal k * kappa_retries.
+
+program.use_split(False)
+
+n_parties = int(program.args[1])
+n = int(program.args[2])
+n_prime = int(program.args[3])
+tau_i = int(program.args[4])
+R_i = int(program.args[5])
+base_i = int(program.args[6])
+k = int(program.args[7])
+kappa_retries = int(program.args[8])
+
+assert n_parties >= 2
+assert n == k * kappa_retries
+
+# --- xorBits(q) + bitness check, identical to multibits_small.mpc. ---
+x = [[sint.get_input_from(sigma) for kk in range(n_prime)]
+     for sigma in range(n_parties)]
+
+checks = Array(n_parties * n_prime, sint)
+idx = 0
+for sigma in range(n_parties):
+    for kk in range(n_prime):
+        checks[idx] = x[sigma][kk] * (1 - x[sigma][kk])
+        idx += 1
+opened_checks = checks.reveal_list()
+for v in opened_checks:
+    runtime_error_if(v != 0,
+                      'bitness check failed: some input was not in {0,1}')
+
+b = x[0]
+for sigma in range(1, n_parties):
+    prod = [b[kk] * x[sigma][kk] for kk in range(n_prime)]
+    b = [b[kk] + x[sigma][kk] - 2 * prod[kk] for kk in range(n_prime)]
+
+# --- Consistency-check side i, identical to multibits_small.mpc: opens a
+# coin-tossed public challenge r and the masked linear combination z, so
+# the orchestrator can compare it against modconv1_preproc_check.mpc's z~
+# and confirm this domain's bits really are the same as every other
+# domain's. ---
+for rho in range(R_i):
+    r_local = [[sint.get_input_from(sigma) for kk in range(n)]
+               for sigma in range(n_parties)]
+    r_shared = [sum(r_local[sigma][kk] for sigma in range(n_parties))
+                for kk in range(n)]
+    r_arr = Array(n, sint)
+    for kk in range(n):
+        r_arr[kk] = r_shared[kk]
+    r_opened = r_arr.reveal_list()
+
+    for kk in range(n):
+        print_ln('r %s %s %s', rho, kk, r_opened[kk])
+
+    block_start = base_i + rho * tau_i
+    z = sint(0)
+    for kk in range(n):
+        z = z + r_opened[kk] * b[kk]
+    for c in range(tau_i):
+        z = z + (1 << c) * b[block_start + c]
+    print_ln('z %s %s', rho, z.reveal())
+
+# --- Per-candidate mask material: m_L (k-1 low bits) and m_U (top bit),
+# for every one of the kappa_retries candidate batches, persisted --
+# secret shares only, nothing opened. ---
+for j in range(kappa_retries):
+    batch = b[j * k:(j + 1) * k]
+    m_L = sint(0)
+    for i in range(k - 1):
+        m_L = m_L + (1 << i) * batch[i]
+    m_U = batch[k - 1]
+    sint.write_to_file([m_L, m_U], position=2 * j)

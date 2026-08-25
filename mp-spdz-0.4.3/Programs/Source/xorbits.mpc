@@ -1,0 +1,94 @@
+# xorbits.mpc
+#
+# Pi_xorBits^(q) (paper "Better Modulus Conversion for MPC and Threshold
+# FHE", Damgaard/Hasler/Kolby/Pawlak, Section 5 / Protocol xorBits, the
+# "else" branch for a non-2-power prime q -- which is our case, q and t are
+# both odd primes).
+#
+# On input x_1, ..., x_N in {0,1}^n from the N parties (one length-n bit
+# vector per party), this computes n independent sharings of
+# XOR_sigma x_sigma, entirely inside ONE arithmetic domain q. It is the
+# per-domain combination step that a MultiBit is built from: run this once
+# per modulus (q, t, and later an auxiliary large Q for the consistency
+# check) on correlated inputs and you get a bit shared simultaneously in
+# each domain.
+#
+# Two things the paper leaves to a sub-protocol are simplified here and
+# documented as such (see xorbits_README.md):
+#   - CheckedInput (a batched, FLIOP-based proof that n bits are all really
+#     0/1) is replaced by the direct, unbatched check open(x*(1-x)) == 0 for
+#     every bit of every party, aborting otherwise. This is real MPC (the
+#     check reveals nothing beyond "this was a bit", since x*(1-x) is always
+#     literally 0 for a genuine bit) but costs one multiplication + opening
+#     per bit instead of O(1) amortized per batch.
+#   - The XOR combination u xor v := u + v - 2*Mul(u,v) uses MP-SPDZ's
+#     native sint multiplication directly, which already *is* an
+#     implementation of a secure multiplication protocol (Beaver triples
+#     under the hood) -- there's no need to hand-roll Beaver here.
+#
+# Compile-time args: <n_parties> <n_bits> [<reveal_for_test>]
+#   reveal_for_test (default 0): if 1, also reveal+print the resulting bits,
+#   for standalone correctness testing against xorbits_gen_inputs.py's
+#   expected output. A real caller (MultiBitsConsCheck) never does this --
+#   the whole point is that the bits stay secret.
+#
+# Example:
+#   ./compile.py -M -P 8095387678513 xorbits 3 20 1
+#   python3 Scripts/xorbits_gen_inputs.py 3 20 --seed 1
+#   Scripts/setup-ssl.sh 3
+#   for i in 0 1 2; do
+#     ./shamir-party.x $i xorbits-3-20-1 -N 3 -P 8095387678513 -OF . &
+#   done
+
+program.use_split(False)
+
+n_parties = int(program.args[1])
+n_bits = int(program.args[2])
+reveal_for_test = int(program.args[3]) if len(program.args) > 3 else 0
+
+assert n_parties >= 2
+assert n_bits >= 1
+
+# --- Step 1: each party inputs its bit vector, one sint per (party, bit). ---
+x = [[sint.get_input_from(sigma) for k in range(n_bits)]
+     for sigma in range(n_parties)]
+
+# --- Bitness check (stand-in for CheckedInput): open x*(1-x) for every
+# single bit of every party, abort if any is nonzero. This leaks nothing
+# about the x's beyond "all inputs were really bits", since a genuine bit
+# always makes x*(1-x) = 0 regardless of its value.
+#
+# Note these must be checked *individually*, not summed into one opened
+# value first: a malicious party could otherwise pick several non-bit
+# inputs whose individual checks are nonzero but happen to cancel out mod
+# q, so that their sum opens to 0 while the bitness property still fails. ---
+checks = Array(n_parties * n_bits, sint)
+idx = 0
+for sigma in range(n_parties):
+    for k in range(n_bits):
+        checks[idx] = x[sigma][k] * (1 - x[sigma][k])
+        idx += 1
+opened_checks = checks.reveal_list()
+for v in opened_checks:
+    runtime_error_if(v != 0,
+                      'bitness check failed: some input was not in {0,1}')
+
+# --- Step 2: combine via sequential secure XOR, b = x_1 (xor) x_2 (xor) ...
+# Each xor of two shared bits costs exactly one secure multiplication
+# (Beaver triple, 1 round to open the two masked values) -- see the
+# discussion of why this can't be done locally. N-1 multiplications total,
+# done here as N-1 *sequential* rounds (each xor depends on the previous
+# one's result); MP-SPDZ still batches the n_bits of one round into a
+# single vectorized multiplication instruction. ---
+b = x[0]
+for sigma in range(1, n_parties):
+    prod = [b[k] * x[sigma][k] for k in range(n_bits)]
+    b = [b[k] + x[sigma][k] - 2 * prod[k] for k in range(n_bits)]
+
+if reveal_for_test:
+    b_arr = Array(n_bits, sint)
+    for k in range(n_bits):
+        b_arr[k] = b[k]
+    opened_b = b_arr.reveal_list()
+    for k in range(n_bits):
+        print_ln('xorbits[%s] = %s', k, opened_b[k])

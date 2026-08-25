@@ -1,0 +1,131 @@
+# modconv1_online.mpc
+#
+# Online phase of Pi^{q,t,beta}_ModConv1 (Damgaard, Hasler, Kolby, Pawlak,
+# "Better Modulus Conversion for MPC and Threshold FHE", Section 4.1),
+# benchmarked on top of MP-SPDZ's native Shamir sharing.
+#
+# Scope of this first version (see README.md in this folder for the full
+# writeup):
+#   - The mask m and the per-party corrections u_0..u_{beta-1} come from a
+#     TRUSTED DEALER (Scripts_modconv1/dealer.py), not from the paper's
+#     actual secure preprocessing protocol (Protocol modconv1-preproc, which
+#     needs MultiBit generation + a secure comparison). This is a stand-in
+#     to get real online-phase numbers now; the real preprocessing is
+#     future work.
+#   - The mask m is supplied as party 0's private Input, so party 0
+#     technically learns m in this version -- a real deployment needs the
+#     secure preprocessing protocol instead, under which no single party
+#     ever learns m.
+#   - q is realized as MP-SPDZ's native compiled/runtime prime (pass the
+#     same value to -P at compile time and at run time). t is a second,
+#     independent prime that only ever appears in local (non-interactive)
+#     arithmetic -- exactly as the protocol requires, since Comb is free
+#     for an LSSS. There is no live MP-SPDZ "domain" for t; each party
+#     just keeps its own plain machine integer share of every u_i and of
+#     the final output.
+#
+# Compile-time args: <n_parties> <beta> <n_conversions> <q> <t>
+# q and t must both be prime (this is checked by the -P flags below, which
+# will fail loudly with "... is not a prime" otherwise). -M disables a
+# compiler optimization that can reorder the per-party file reads used for
+# the trusted-dealer corrections (see README.md).
+#
+# Example (see README.md for the full walkthrough, including the dealer
+# script that has to run first):
+#   ./compile.py -M -P 8095387678513 modconv1_online 3 4 1000 8095387678513 7368787
+#   python3 Scripts/modconv1_dealer.py 3 4 1000 8095387678513 7368787
+#   for i in 0 1 2; do
+#     ./shamir-party.x $i modconv1_online-3-4-1000-8095387678513-7368787 \
+#         -N 3 -P 8095387678513 -OF . -v -d &
+#   done
+#
+# -d (direct communication) matters for the round count: MP-SPDZ's default
+# star-shaped opening takes 2 rounds; direct opening takes the 1 round the
+# protocol claims, at the cost of quadratic (rather than linear) messages.
+
+program.use_split(False)
+
+n_parties = int(program.args[1])
+beta = int(program.args[2])
+n_conversions = int(program.args[3])
+q = int(program.args[4])
+t = int(program.args[5])
+
+assert beta >= 2
+assert n_parties >= 3
+
+# alpha(y) = floor(beta * y / q). Computing this as (beta * y_int) // q on
+# a regint overflows 64-bit signed arithmetic once beta * q exceeds ~2^63
+# (easily reached, e.g. beta=64 with a 61-bit q). Since the interval
+# boundaries ceil(i*q/beta) are public and known at compile time (as
+# unbounded Python ints), alpha(y) is instead computed by counting how
+# many boundaries y has passed -- only ever comparing regints against
+# values below q, so it never overflows.
+interval_boundaries = [-(-(i * q) // beta) for i in range(1, beta)]
+
+def interval_index(y_int):
+    idx = regint(0)
+    for boundary in interval_boundaries:
+        idx = idx + (y_int >= boundary)
+    return idx
+
+q_bits = q.bit_length()
+
+def to_unsigned_regint(y):
+    # regint(cint) reinterprets any residue >= p/2 as negative (MP-SPDZ's
+    # usual convention for signed k-bit integers padded by a much larger
+    # prime). Here q *is* the whole prime with no such headroom -- y can
+    # land anywhere in [0, q) -- so that conversion silently wraps half the
+    # time. Bit-decomposing the (public) clear value and recomposing it as
+    # a regint gives the true unsigned integer instead.
+    bits = y.bit_decompose(q_bits)
+    total = regint(0)
+    for i, b in enumerate(bits):
+        total = total + (regint(b) << i)
+    return total
+
+for c in range(n_conversions):
+    # --- Inputs (outside the timed online phase: Input is a separate ABB
+    # command, not part of ModConv itself) ---
+    # Trusted-dealer mask, mod q. In the real protocol this is preprocessing
+    # that no party should learn; here party 0 inputs it in the clear as an
+    # explicit, documented simplification (see header comment).
+    m = sint.get_input_from(0)
+    # Real secret input to convert, mod q, provided by party 1 for this test.
+    x = sint.get_input_from(1)
+
+    # Each party's own additive share of u_0 .. u_{beta-1} mod t, written by
+    # the dealer directly into that party's own
+    # Player-Data/Input-Binary-P<player>-0 file. personal.read_int(sigma)
+    # only actually performs a read when the executing party's number is
+    # sigma; summing the masked (_op_san) results collapses the N tagged
+    # copies down to "my own value", entirely locally, with no MPC
+    # protocol involved.
+    u_local = []
+    for i in range(beta):
+        per_party = [personal.read_int(sigma) for sigma in range(n_parties)]
+        my_u_i = regint(0)
+        for sigma in range(n_parties):
+            my_u_i = my_u_i + per_party[sigma]._op_san()
+        u_local.append(my_u_i)
+
+    # --- Online phase: the only communication is this one opening ---
+    start_timer(1)
+    y = (x + m).reveal()
+    y_int = to_unsigned_regint(y)
+    alpha_y = interval_index(y_int)
+
+    u_arr = Array(beta, regint)
+    for i in range(beta):
+        u_arr[i] = u_local[i]
+    u_sel = u_arr[alpha_y]
+
+    # x_t = y - u_{alpha(y)} where y is PUBLIC and u is additively shared:
+    # only one party (by convention, party 0) may add the public y to its
+    # own share, or y would be added once per party instead of once total.
+    is_party0 = get_player_id()._v == 0
+    y_contribution = is_party0 * y_int
+    x_t_share = (y_contribution - u_sel) % t
+    stop_timer(1)
+
+    print_ln('conversion %s: local mod-t share = %s', c, x_t_share)

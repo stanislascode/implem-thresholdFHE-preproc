@@ -1,0 +1,31 @@
+# modconv1_preproc_finalize_t.mpc
+#
+# Step 5-6 of Pi_ModConv1Preproc (t side, beta=2): given the accepted
+# candidate index r_star (public, see modconv1_preproc_finalize_q.mpc's
+# header), read that candidate's (m_L, m_U) back from the t-domain
+# Persistence file that modconv1_preproc_t.mpc wrote, form
+# m = m_L + ceil(q/2)*m_U, then the two beta=2 corrections
+#   u_0 = m - q*m_U   (paper: u_0 = m - c_0*q, c_0 = alpha(m) = m_U)
+#   u_1 = m           (c_1 = 0 always, for beta=2)
+# and persist u_0, u_1 for the online phase. As in the q side, nothing is
+# ever opened -- these stay genuine Shamir sharings over t throughout,
+# which is what lets the online phase compose with them via ordinary local
+# sint arithmetic once y is public (see modconv1_preproc_README.md for how
+# this differs from the trusted-dealer version's plain additive shares).
+#
+# Compile-time args: <q> <kappa_retries> <r_star>
+
+q = int(program.args[1])
+kappa_retries = int(program.args[2])
+r_star = int(program.args[3])
+
+assert 0 <= r_star < kappa_retries
+
+_, (m_L, m_U) = sint.read_from_file(2 * r_star, n_items=2)
+ceil_q_2 = -(-q // 2)
+m = m_L + ceil_q_2 * m_U
+
+u_0 = m - q * m_U
+u_1 = m
+
+sint.write_to_file([u_0, u_1], position=2 * kappa_retries)

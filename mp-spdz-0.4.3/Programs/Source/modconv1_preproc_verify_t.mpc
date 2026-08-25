@@ -1,0 +1,18 @@
+# modconv1_preproc_verify_t.mpc -- TEST ONLY.
+#
+# Reveals the final persisted corrections u_0, u_1 (t-domain) that
+# modconv1_preproc_finalize_t.mpc wrote, so the orchestrator can compare
+# them against a plaintext-computed expectation. A real deployment never
+# does this -- u_0, u_1 must stay secret for the online phase to be
+# secure.
+#
+# Compile-time args: <kappa_retries>
+
+kappa_retries = int(program.args[1])
+
+_, (u_0, u_1) = sint.read_from_file(2 * kappa_retries, n_items=2)
+opened = Array(2, sint)
+opened[0] = u_0
+opened[1] = u_1
+for k, v in enumerate(opened.reveal_list()):
+    print_ln('u %s %s', k, v)

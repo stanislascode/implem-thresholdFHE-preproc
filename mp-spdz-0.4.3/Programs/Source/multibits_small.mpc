@@ -1,0 +1,116 @@
+# multibits_small.mpc
+#
+# The "side i" (i < ell) half of Pi_MultiBitsConsCheck, run inside a small
+# modulus q_i (in our setup: q or t). Paired with multibits_large.mpc, which
+# plays the "side ell" role inside an auxiliary large modulus Q -- needed
+# because q and t are of similar size, so neither satisfies the check's
+# precondition against the other directly (see multibits_README.md).
+#
+# This script:
+#   1. Generates this domain's share of the MultiBit vector b (length
+#      n_prime) via xorBits (imported from xorbits.mpc's logic, inlined
+#      here to keep both scripts self-contained).
+#   2. For each repetition rho in [R_i): draws a public random challenge
+#      r via real secure coin-tossing (each party inputs a uniform mask,
+#      summed and opened -- the same pattern as opening y in ModConv1),
+#      forms the public weight vector w (r on the first n slots, a
+#      power-of-two ladder on this repetition's dedicated sacrificial
+#      block, 0 elsewhere), computes z = <w, b> (a local linear
+#      combination -- Comb is free) and opens it.
+#   3. Prints the opened r-vector and z for each repetition, so the
+#      orchestrator (Scripts/multibits_gen.py) can feed the same r into
+#      multibits_large.mpc's execution and compare the two openings mod
+#      q_i afterwards -- a comparison of two already-public values, which
+#      needs no further MPC (see multibits_README.md).
+#
+# Compile-time args: <n_parties> <n> <n_prime> <tau_i> <R_i> <base_i>
+#   n         -- number of real MultiBits this check ultimately yields
+#   n_prime   -- total length of the bit vector b (real + all sacrificed
+#                blocks, shared identically across q, t and Q)
+#   tau_i, R_i, base_i -- this domain's block width, repetition count, and
+#                the starting index of its first sacrificial block within
+#                [n, n_prime) (computed by the orchestrator from q_i's and
+#                the other small domain's bit-lengths)
+
+program.use_split(False)
+
+n_parties = int(program.args[1])
+n = int(program.args[2])
+n_prime = int(program.args[3])
+tau_i = int(program.args[4])
+R_i = int(program.args[5])
+base_i = int(program.args[6])
+reveal_for_test = int(program.args[7]) if len(program.args) > 7 else 0
+
+assert n_parties >= 2
+assert base_i + R_i * tau_i <= n_prime
+
+# --- xorBits(q_i): identical to xorbits.mpc, generating n_prime shared bits
+# from the N parties' bit vectors (the SAME underlying bits across q, t, Q --
+# the orchestrator writes one shared set of Input-P<sigma>-0 files that all
+# three domain executions read). ---
+x = [[sint.get_input_from(sigma) for k in range(n_prime)]
+     for sigma in range(n_parties)]
+
+checks = Array(n_parties * n_prime, sint)
+idx = 0
+for sigma in range(n_parties):
+    for k in range(n_prime):
+        checks[idx] = x[sigma][k] * (1 - x[sigma][k])
+        idx += 1
+opened_checks = checks.reveal_list()
+for v in opened_checks:
+    runtime_error_if(v != 0,
+                      'bitness check failed: some input was not in {0,1}')
+
+b = x[0]
+for sigma in range(1, n_parties):
+    prod = [b[k] * x[sigma][k] for k in range(n_prime)]
+    b = [b[k] + x[sigma][k] - 2 * prod[k] for k in range(n_prime)]
+
+# --- Consistency-check side i: R_i repetitions. ---
+for rho in range(R_i):
+    # func_Rand(Z_{q_i}^n): each party inputs a uniform local mask over the
+    # compiled prime; the sum of at least one honest party's uniform value
+    # is itself uniform, so opening it is a genuine unbiased public random
+    # vector -- the same "input+sum+reveal" coin-tossing already used for
+    # y in modconv1_online.mpc.
+    r_local = [[sint.get_input_from(sigma) for k in range(n)]
+               for sigma in range(n_parties)]
+    r_shared = [sum(r_local[sigma][k] for sigma in range(n_parties))
+                for k in range(n)]
+    r_arr = Array(n, sint)
+    for k in range(n):
+        r_arr[k] = r_shared[k]
+    r_opened = r_arr.reveal_list()
+
+    for k in range(n):
+        print_ln('r %s %s %s', rho, k, r_opened[k])
+
+    block_start = base_i + rho * tau_i
+
+    # z = <w, b> with w = (r on [0,n), powers of 2 on this repetition's
+    # block, 0 elsewhere). Both r (now public) and the powers of 2 are
+    # public scalars multiplying shared bits, so z's share is computed
+    # entirely locally; only its final opening is interactive.
+    z = sint(0)
+    for k in range(n):
+        z = z + r_opened[k] * b[k]
+    for c in range(tau_i):
+        z = z + (1 << c) * b[block_start + c]
+
+    z_opened = z.reveal()
+    print_ln('z %s %s', rho, z_opened)
+
+# --- Test-mode sanity output (opt-in, reveal_for_test=1 only): reveal the
+# real (unsacrificed) prefix so the orchestrator can cross-check it against
+# the other domains' prefixes and against the plaintext-computed expected
+# XOR. A real caller never does this -- the whole point of the MultiBit is
+# that b stays secret -- which is why it's gated behind an explicit flag
+# rather than being the default. ---
+if reveal_for_test:
+    b_arr = Array(n, sint)
+    for k in range(n):
+        b_arr[k] = b[k]
+    for k, v in enumerate(b_arr.reveal_list()):
+        print_ln('b %s %s', k, v)

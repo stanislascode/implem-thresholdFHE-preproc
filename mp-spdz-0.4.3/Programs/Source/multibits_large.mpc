@@ -1,0 +1,121 @@
+# multibits_large.mpc
+#
+# The "side ell" (auxiliary large-modulus) half of Pi_MultiBitsConsCheck,
+# paired with one or more runs of multibits_small.mpc. See that file's
+# header and multibits_README.md for the full picture: q and t are both
+# checked against this domain's auxiliary prime Q, which is thrown away
+# afterwards, because neither q nor t is individually large enough to
+# satisfy the check's precondition against the other.
+#
+# This script:
+#   1. Generates Q's share of the SAME MultiBit vector b (length n_prime)
+#      via xorBits, from the same underlying per-party bit vectors as every
+#      small-domain run (the orchestrator reuses the same Input-P<sigma>-0
+#      files for all of q's, t's and Q's executions).
+#   2. For every small domain i and every repetition rho, rebuilds the
+#      exact same public weight vector w the small side used (using the
+#      r-vector that domain opened, passed in here as compile-time public
+#      constants -- r is already public by the time this script is
+#      compiled, since the orchestrator runs the small domains first),
+#      draws a fresh secret random mask eta via the VM's native RandomBit
+#      instruction (sint.get_random_bit(), real preprocessing, not
+#      simulated), computes z~ = <w, b> + q_i * eta (again a local linear
+#      combination) and opens it.
+#   3. Prints every opened z~, so the orchestrator can compare it against
+#      the matching small-domain z modulo q_i -- the only step of the
+#      whole check that isn't already done once the openings exist.
+#
+# Compile-time args:
+#   <n_parties> <n> <n_prime> <tau_ell> <L>
+#   then, for each of the L small domains, in order: <q_i> <tau_i> <R_i> <base_i>
+#   then: <r_data_file> [<reveal_for_test>]
+#
+# r_data_file is a path to a JSON file containing a list of L entries, one
+# per small domain in the same order as above, each a list of R_i rows of
+# n integers -- the r-vectors that domain's multibits_small.mpc run opened
+# (must match the order that script printed them in). This is passed via a
+# file rather than positional args because n can be large enough (e.g. for
+# modconv1-preproc, where n = k * kappa_retries) that embedding it in the
+# compiled program's name -- MP-SPDZ's own naming convention appends every
+# positional arg -- would exceed the OS filename length limit.
+
+program.use_split(False)
+
+import json
+
+pos = 1
+n_parties = int(program.args[pos]); pos += 1
+n = int(program.args[pos]); pos += 1
+n_prime = int(program.args[pos]); pos += 1
+tau_ell = int(program.args[pos]); pos += 1
+L = int(program.args[pos]); pos += 1
+
+domains = []
+for _ in range(L):
+    q_i = int(program.args[pos]); pos += 1
+    tau_i = int(program.args[pos]); pos += 1
+    R_i = int(program.args[pos]); pos += 1
+    base_i = int(program.args[pos]); pos += 1
+    domains.append(dict(q_i=q_i, tau_i=tau_i, R_i=R_i, base_i=base_i))
+
+r_data_file = program.args[pos]; pos += 1
+with open(r_data_file) as f:
+    r_data = json.load(f)
+for dom, r in zip(domains, r_data):
+    dom['r'] = r
+
+reveal_for_test = int(program.args[pos]) if len(program.args) > pos else 0
+
+assert n_parties >= 2
+
+# --- xorBits(Q): identical machinery as the small side, same input files. ---
+x = [[sint.get_input_from(sigma) for k in range(n_prime)]
+     for sigma in range(n_parties)]
+
+checks = Array(n_parties * n_prime, sint)
+idx = 0
+for sigma in range(n_parties):
+    for k in range(n_prime):
+        checks[idx] = x[sigma][k] * (1 - x[sigma][k])
+        idx += 1
+opened_checks = checks.reveal_list()
+for v in opened_checks:
+    runtime_error_if(v != 0,
+                      'bitness check failed: some input was not in {0,1}')
+
+b = x[0]
+for sigma in range(1, n_parties):
+    prod = [b[k] * x[sigma][k] for k in range(n_prime)]
+    b = [b[k] + x[sigma][k] - 2 * prod[k] for k in range(n_prime)]
+
+# --- Consistency-check side ell: for every small domain, every repetition. ---
+for dom_idx, dom in enumerate(domains):
+    q_i, tau_i, R_i, base_i = dom['q_i'], dom['tau_i'], dom['R_i'], dom['base_i']
+    for rho in range(R_i):
+        r_opened = dom['r'][rho]
+        block_start = base_i + rho * tau_i
+
+        # eta = sum_j 2^j * RandomBit_j, a fresh secret mask in Z_Q. This is
+        # func_Abb.RandomBit(), realized by MP-SPDZ's native `bit`
+        # instruction (real preprocessing under Shamir, not simulated).
+        eta = sint(0)
+        for j in range(tau_ell):
+            eta = eta + (1 << j) * sint.get_random_bit()
+
+        z_tilde = sint(0)
+        for k in range(n):
+            z_tilde = z_tilde + r_opened[k] * b[k]
+        for c in range(tau_i):
+            z_tilde = z_tilde + (1 << c) * b[block_start + c]
+        z_tilde = z_tilde + q_i * eta
+
+        z_tilde_opened = z_tilde.reveal()
+        print_ln('ztilde %s %s %s', dom_idx, rho, z_tilde_opened)
+
+# --- Test-mode sanity output (opt-in), as in multibits_small.mpc. ---
+if reveal_for_test:
+    b_arr = Array(n, sint)
+    for k in range(n):
+        b_arr[k] = b[k]
+    for k, v in enumerate(b_arr.reveal_list()):
+        print_ln('b %s %s', k, v)

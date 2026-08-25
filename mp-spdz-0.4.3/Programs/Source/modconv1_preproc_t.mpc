@@ -1,0 +1,114 @@
+# modconv1_preproc_t.mpc
+#
+# The t-domain half of Pi_ModConv1Preproc^{q,t,Q} for beta=2, with the
+# auxiliary comparison modulus Q set to t (see modconv1_preproc_q.mpc's
+# header and modconv1_preproc_README.md for why). This is the domain that
+# also plays "Q" in the paper's protocol, so on top of everything
+# modconv1_preproc_q.mpc does (xorBits(t) + consistency-check side +
+# per-candidate mask material), this script additionally runs the real
+# Compare protocol (paper's Pi_Compare, compare.tex) and the accept-bit
+# computation for every candidate, entirely locally within this one
+# domain's execution -- exactly what collapsing Q into t buys: Compare
+# needs the mask bits shared over Q, and here that's the same sharing
+# already produced by xorBits(t).
+#
+# Compile-time args: <n_parties> <n> <n_prime> <tau_i> <R_i> <base_i> <k>
+#                     <kappa_retries> <q>
+#   q is needed here only to derive the public threshold T = floor(q/2)
+#   for Compare, and to test q's parity (our q's are always odd primes, so
+#   this always takes the "q odd" branch of Step 4 of the paper's
+#   protocol, i.e. accept = lt + eq*(1 - m_U)).
+
+program.use_split(False)
+
+n_parties = int(program.args[1])
+n = int(program.args[2])
+n_prime = int(program.args[3])
+tau_i = int(program.args[4])
+R_i = int(program.args[5])
+base_i = int(program.args[6])
+k = int(program.args[7])
+kappa_retries = int(program.args[8])
+q = int(program.args[9])
+
+assert n_parties >= 2
+assert n == k * kappa_retries
+assert q % 2 == 1, 'q even is not exercised by this implementation'
+
+n_cmp = k - 1                      # Compare's own bit-length parameter
+T = q // 2                          # floor(q/2), the public threshold
+T_bits = [(T >> i) & 1 for i in range(n_cmp)]
+
+# --- xorBits(t) + bitness check, identical to multibits_small.mpc. ---
+x = [[sint.get_input_from(sigma) for kk in range(n_prime)]
+     for sigma in range(n_parties)]
+
+checks = Array(n_parties * n_prime, sint)
+idx = 0
+for sigma in range(n_parties):
+    for kk in range(n_prime):
+        checks[idx] = x[sigma][kk] * (1 - x[sigma][kk])
+        idx += 1
+opened_checks = checks.reveal_list()
+for v in opened_checks:
+    runtime_error_if(v != 0,
+                      'bitness check failed: some input was not in {0,1}')
+
+b = x[0]
+for sigma in range(1, n_parties):
+    prod = [b[kk] * x[sigma][kk] for kk in range(n_prime)]
+    b = [b[kk] + x[sigma][kk] - 2 * prod[kk] for kk in range(n_prime)]
+
+# --- Consistency-check side i, identical to modconv1_preproc_q.mpc's. ---
+for rho in range(R_i):
+    r_local = [[sint.get_input_from(sigma) for kk in range(n)]
+               for sigma in range(n_parties)]
+    r_shared = [sum(r_local[sigma][kk] for sigma in range(n_parties))
+                for kk in range(n)]
+    r_arr = Array(n, sint)
+    for kk in range(n):
+        r_arr[kk] = r_shared[kk]
+    r_opened = r_arr.reveal_list()
+
+    for kk in range(n):
+        print_ln('r %s %s %s', rho, kk, r_opened[kk])
+
+    block_start = base_i + rho * tau_i
+    z = sint(0)
+    for kk in range(n):
+        z = z + r_opened[kk] * b[kk]
+    for c in range(tau_i):
+        z = z + (1 << c) * b[block_start + c]
+    print_ln('z %s %s', rho, z.reveal())
+
+# --- Per candidate: persist (m_L, m_U), then Pi_Compare(m_L against T),
+# then the accept bit. Everything up to the final open() is local (Comb
+# for e_i and for lt/eq, Mul only for the suffix-AND and for the final
+# eq*m_U term) -- matching the paper's own count of interactive steps. ---
+for j in range(kappa_retries):
+    batch = b[j * k:(j + 1) * k]
+    m_L_bits = batch[:n_cmp]
+    m_U = batch[n_cmp]
+
+    m_L = sint(0)
+    for i in range(n_cmp):
+        m_L = m_L + (1 << i) * m_L_bits[i]
+    sint.write_to_file([m_L, m_U], position=2 * j)
+
+    # Pi_Compare^{t, n_cmp, T}(m_L_bits): e_i = (1-T_i) + (2T_i-1)*b_i.
+    e = [(1 - T_bits[i]) + (2 * T_bits[i] - 1) * m_L_bits[i]
+         for i in range(n_cmp)]
+    # Suffix products E_{n_cmp} := 1, E_j := E_{j+1} * e_j, sequentially.
+    E = [None] * (n_cmp + 1)
+    E[n_cmp] = sint(1)
+    for jj in range(n_cmp - 1, -1, -1):
+        E[jj] = E[jj + 1] * e[jj]
+    eq = E[0]
+    lt = sint(0)
+    for jj in range(n_cmp):
+        if T_bits[jj] == 1:
+            lt = lt + (E[jj + 1] - E[jj])
+
+    # q is always odd here: accept = lt + eq*(1 - m_U) = lt + eq - eq*m_U.
+    accept = lt + eq - eq * m_U
+    print_ln('accept %s %s', j, accept.reveal())
